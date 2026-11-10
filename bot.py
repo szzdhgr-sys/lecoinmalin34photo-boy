@@ -1,5 +1,6 @@
 import json, os, time, threading, requests, io, gc
 from flask import Flask, send_from_directory, jsonify
+from bot_v6 import configured_admin_ids, is_admin_user, env_int, ordered_message_ids, format_uptime
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
@@ -28,7 +29,11 @@ if not WEBAPP_URL and PUBLIC_DOMAIN:
     WEBAPP_URL = "https://" + PUBLIC_DOMAIN
 
 API = f"https://api.telegram.org/bot{TOKEN}"
-PAGE_SIZE = 20
+PAGE_SIZE = env_int(os.environ.get("PAGE_SIZE"), 8, 1, 20)
+ADMIN_IDS = configured_admin_ids(os.environ.get("ADMIN_USER_ID", ""))
+STARTED_AT = time.monotonic()
+POLL_LAST_OK = STARTED_AT
+POLL_WORKER = None
 SOURCE_CHAT_ID = None
 BUILD_VERSION = "APP-V1-AUTO-CATEGORIES-NOUVEAUTES-HISTORIQUE"
 
@@ -1032,6 +1037,37 @@ def api(method, **data):
         print("Telegram error:", method, j, flush=True)
     return j
 
+def copy_catalog_messages(chat_id, message_ids):
+    """copyMessages exige des IDs strictement croissants."""
+    ids = ordered_message_ids(message_ids)
+    if not ids:
+        return {"ok": False, "description": "Aucun message"}
+    source = SOURCE_CHAT_ID if SOURCE_CHAT_ID is not None else SOURCE_CHAT
+    response = api("copyMessages", chat_id=chat_id, from_chat_id=source, message_ids=ids)
+    if response.get("ok"):
+        return response
+    sent = 0
+    for mid in ids:
+        if api("copyMessage", chat_id=chat_id, from_chat_id=source, message_id=mid).get("ok"):
+            sent += 1
+        else:
+            time.sleep(0.08)
+    return {"ok": True, "copied": sent, "partial": sent != len(ids)} if sent else response
+
+
+@app.get("/health")
+def health():
+    seconds_since_poll = time.monotonic() - POLL_LAST_OK
+    alive = POLL_WORKER is not None and POLL_WORKER.is_alive()
+    ok = alive and seconds_since_poll < 125
+    return jsonify({
+        "ok": ok, "version": "V6", "polling_alive": alive,
+        "last_poll_seconds_ago": int(seconds_since_poll),
+        "source_connected": SOURCE_CHAT_ID is not None,
+        "uptime_seconds": int(time.monotonic() - STARTED_AT)
+    }), 200 if ok else 503
+
+
 def catalog_totals():
     topics = len(CATALOG)
     items = sum(len(c.get("message_ids", [])) for c in CATALOG.values())
@@ -1100,10 +1136,7 @@ def send_new_page(chat_id, offset=0):
     api("sendMessage", chat_id=chat_id,
         text=f"🆕 <b>NOUVEAUTÉS</b>\nLes {len(page)} dernières publications du catalogue 👇",
         parse_mode="HTML")
-    res = api("copyMessages", chat_id=chat_id, from_chat_id=SOURCE_CHAT, message_ids=page)
-    if not res.get("ok"):
-        # Certains clients Telegram/API préfèrent un ordre croissant : repli robuste.
-        res = api("copyMessages", chat_id=chat_id, from_chat_id=SOURCE_CHAT, message_ids=sorted(page))
+    res = copy_catalog_messages(chat_id, page)
     nav=[]
     if offset > 0:
         nav.append({"text":"⬅️ Plus récentes","callback_data":f"new:{max(0,offset-PAGE_SIZE)}"})
@@ -1487,7 +1520,7 @@ def send_page(chat_id, tid, offset=0):
         text=f"✨ <b>{title}</b>\n📷 {p} photos  ·  🎬 {v} vidéos  ·  📝 {t} textes\n\nAffichage {offset+1}–{end} sur {total}",
         parse_mode="HTML")
 
-    res=api("copyMessages", chat_id=chat_id, from_chat_id=SOURCE_CHAT, message_ids=page)
+    res=copy_catalog_messages(chat_id, page)
     if not res.get("ok"):
         return api("sendMessage", chat_id=chat_id,
                    text=f"⚠️ Telegram n’a pas pu copier ces médias.\n<code>{res.get('description','Erreur inconnue')}</code>",
@@ -1510,16 +1543,8 @@ def send_page(chat_id, tid, offset=0):
 
 
 def _index_owner_ok(chat_id):
-    """Premier utilisateur qui lance /indeximages devient propriétaire de l'indexation."""
-    try:
-        if INDEX_OWNER_FILE and INDEX_OWNER_FILE.exists():
-            return INDEX_OWNER_FILE.read_text(encoding="utf-8").strip() == str(chat_id)
-        if INDEX_OWNER_FILE:
-            INDEX_OWNER_FILE.parent.mkdir(parents=True, exist_ok=True)
-            INDEX_OWNER_FILE.write_text(str(chat_id), encoding="utf-8")
-        return True
-    except Exception:
-        return True
+    """Seuls les identifiants ADMIN_USER_ID explicites accèdent aux scans."""
+    return is_admin_user(chat_id, ADMIN_IDS)
 
 def _clear_previous_shoe_index():
     """Supprime les anciens classements chaussures avant une analyse complète."""
@@ -1594,6 +1619,8 @@ def handle(u):
 
         if txt.startswith("/cancel"):
             SEARCH_WAITING.pop(chat_id, None)
+            if not _index_owner_ok(chat_id):
+                return api("sendMessage", chat_id=chat_id, text="✅ Recherche annulée.")
             stopped = []
             with INDEXING_LOCK:
                 for tid in list(INDEXING_TOPICS):
@@ -1608,7 +1635,13 @@ def handle(u):
             return api("sendMessage", chat_id=chat_id, text="✅ Recherche annulée.")
 
         if txt.startswith(("/start", "/menu")):
-            return send_start(pm["chat"]["id"])
+            return send_start(chat_id)
+        if txt.startswith("/ping"):
+            return api("sendMessage", chat_id=chat_id,
+                text=f"✅ Bot Telegram actif — V6\n⏱️ En ligne depuis : {format_uptime(time.monotonic() - STARTED_AT)}")
+        if txt.startswith("/help"):
+            return api("sendMessage", chat_id=chat_id,
+                text="🖤💛 LE COIN MALIN 34\n/start — Catalogue\n/menu — Accueil\n/ping — Test\n/status — Synchronisation\n/cancel — Annuler")
         if txt.startswith("/status"):
             total_new = 0
             runtime = RUNTIME_CATALOG.exists()
@@ -1658,6 +1691,8 @@ def handle(u):
                 reply_markup=group_keyboard(gid)
             )
     if d.startswith("cancelscan:"):
+        if not _index_owner_ok(chat_id):
+            return api("sendMessage", chat_id=chat_id, text="⛔ Réservé à l'administrateur.")
         tid = d.split(":", 1)[1]
         with INDEXING_LOCK:
             if tid in INDEXING_TOPICS:
@@ -1800,6 +1835,7 @@ def start_background_index(chat_id, tid, force_image=False, silent_start=False):
     )
 
 def poll():
+    global POLL_LAST_OK
     offset=0
     while True:
         try:
@@ -1832,6 +1868,7 @@ def poll():
                 time.sleep(5)
                 continue
 
+            POLL_LAST_OK = time.monotonic()
             updates = r.get("result", []) or []
             if updates:
                 print(f"TELEGRAM UPDATES: {len(updates)}", flush=True)
@@ -1849,6 +1886,7 @@ def poll():
             time.sleep(3)
 
 def main():
+    global POLL_WORKER
     if not TOKEN:
         raise SystemExit("BOT_TOKEN manquant : le bot Telegram ne peut pas démarrer")
 
@@ -1868,6 +1906,8 @@ def main():
         raise
     except Exception as e:
         raise SystemExit(f"Impossible de vérifier BOT_TOKEN auprès de Telegram: {e}")
+
+    resolve_source_chat_id()
 
     # Vérifie que le bot est bien présent dans le groupe source.
     # Sans accès au groupe, Telegram ne peut pas lui livrer les nouveaux messages.
@@ -1905,7 +1945,6 @@ def main():
     except Exception as e:
         print(f"TELEGRAM WEBHOOK RESET ERROR: {e!r}", flush=True)
 
-    resolve_source_chat_id()
     backfill_catalog_from_export()
     print(f"Catalogue dynamique: {RUNTIME_CATALOG}", flush=True)
     print(f"AUTO {BUILD_VERSION}: accueil amélioré + recherche chaussures supprimée + topics auto = ACTIVÉ", flush=True)
@@ -1913,7 +1952,10 @@ def main():
     print("TOPIC 2: Articles disponibles sur place = ACTIVÉ", flush=True)
     print("OPENAI API: NON UTILISÉE", flush=True)
     print(f"MODÈLE LOCAL: {LOCAL_VISION_MODEL}", flush=True)
-    threading.Thread(target=poll,daemon=True).start()
+    if not ADMIN_IDS:
+        print("SECURITE: ADMIN_USER_ID absent, scans admin desactives", flush=True)
+    POLL_WORKER = threading.Thread(target=poll, daemon=True, name="telegram-poll")
+    POLL_WORKER.start()
     port=int(os.environ.get("PORT","8080"))
     app.run(host="0.0.0.0",port=port,threaded=True)
 
