@@ -10,3 +10,9 @@ catalog_runtime.json
 brand_catalog_runtime.json
 bot-private.cmd
 data/
+private.env
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+last_backfill.json
+telegram_logo_file_id.txt
