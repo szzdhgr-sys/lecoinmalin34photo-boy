@@ -1,5 +1,13 @@
 import json, os, time, threading, requests, io, gc
 from flask import Flask, send_from_directory, jsonify
+from bot_v6 import configured_admin_ids, is_admin_user, env_int, ordered_message_ids, format_uptime
+from bot_runtime import (
+    DurableUpdateInbox, should_run_backfill, mark_backfill_complete
+)
+from bot_v7_search import (
+    BRANDS, index_entry, index_export_messages, search_ids,
+    brands_for_ids, ids_for_brand, normalized,
+)
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
@@ -21,14 +29,33 @@ SOURCE_CHAT_TITLES = {"Lecoinmalin34w", "Lecoinmalin34a"}
 
 PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "").strip()
-ORDER_URL = os.environ.get("ORDER_URL", "https://t.me/Lecoinmalin34a/76").strip()
 REVIEWS_URL = os.environ.get("REVIEWS_URL", "https://t.me/Lecoinmalin34a/5").strip()
 SOURCE_GROUP_URL = os.environ.get("SOURCE_GROUP_URL", "https://t.me/Lecoinmalin34a").strip()
 if not WEBAPP_URL and PUBLIC_DOMAIN:
     WEBAPP_URL = "https://" + PUBLIC_DOMAIN
 
 API = f"https://api.telegram.org/bot{TOKEN}"
-PAGE_SIZE = 20
+PAGE_SIZE = env_int(os.environ.get("PAGE_SIZE"), 8, 1, 20)
+ADMIN_IDS = configured_admin_ids(os.environ.get("ADMIN_USER_ID", ""))
+STARTED_AT = time.monotonic()
+POLL_LAST_OK = STARTED_AT
+POLL_WORKER = None
+INBOX = None
+UPDATE_WORKERS = []
+HTTP_LOCAL = threading.local()
+
+
+def telegram_session():
+    # One persistent HTTP/TLS session per worker thread.
+    session = getattr(HTTP_LOCAL, "telegram_session", None)
+    if session is None:
+        session = requests.Session()
+        HTTP_LOCAL.telegram_session = session
+    return session
+
+SEARCH_SCOPES = {}       # private_chat_id -> topic id or "all"
+SEARCH_RESULTS = {}      # private_chat_id -> (label, [message ids])
+SEARCH_INDEX_LOCK = threading.RLock()
 SOURCE_CHAT_ID = None
 BUILD_VERSION = "APP-V1-AUTO-CATEGORIES-NOUVEAUTES-HISTORIQUE"
 
@@ -132,6 +159,68 @@ CATALOG_LOCK = RLock()
 BASE_BRANDS = Path("brand_catalog.json")
 RUNTIME_BRANDS = DATA_DIR / "brand_catalog_runtime.json"
 BRAND_LOCK = RLock()
+SEARCH_INDEX_FILE = DATA_DIR / "search_index_runtime.json"
+BACKFILL_STATE_FILE = DATA_DIR / "last_backfill.json"
+LOGO_CACHE_FILE = DATA_DIR / "telegram_logo_file_id.txt"
+
+
+def _load_search_index():
+    if SEARCH_INDEX_FILE.exists():
+        try:
+            with SEARCH_INDEX_FILE.open(encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                return obj
+        except Exception as e:
+            print(f"SEARCH INDEX load error: {e!r}", flush=True)
+    return {}
+
+
+SEARCH_INDEX = _load_search_index()
+
+
+def save_search_index():
+    with SEARCH_INDEX_LOCK:
+        SEARCH_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SEARCH_INDEX_FILE.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(SEARCH_INDEX, f, ensure_ascii=False)
+        tmp.replace(SEARCH_INDEX_FILE)
+
+
+def index_live_publication(message):
+    mid = message.get("message_id")
+    if not isinstance(mid, int):
+        return
+    entry = index_entry(message)
+    if entry is None:
+        return
+    with SEARCH_INDEX_LOCK:
+        if SEARCH_INDEX.get(str(mid)) != entry:
+            SEARCH_INDEX[str(mid)] = entry
+            save_search_index()
+
+
+def rebuild_search_index_from_export(export_path):
+    try:
+        with open(export_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        records = index_export_messages(payload.get("messages") or [])
+        if not records:
+            return 0
+        changed = 0
+        with SEARCH_INDEX_LOCK:
+            for mid, entry in records.items():
+                if mid not in SEARCH_INDEX:
+                    SEARCH_INDEX[mid] = entry
+                    changed += 1
+            if changed:
+                save_search_index()
+        print(f"SEARCH INDEX ✅ fichiers={len(records)} ajoutes_ou_maj={changed}", flush=True)
+        return changed
+    except Exception as e:
+        print(f"SEARCH INDEX export error: {e!r}", flush=True)
+        return 0
 
 def _load_brands():
     source = RUNTIME_BRANDS if RUNTIME_BRANDS.exists() else BASE_BRANDS
@@ -485,11 +574,12 @@ def auto_place_message(m, original_topic, kind, source_title=None, source_is_exp
         if added or moved:
             save_catalog()
 
-    print(
-        f"AUTO CATEGORIE ✅ origine={source_key} destination={dest_key} "
-        f"score={score} raison={reason} message={m.get('id') if source_is_export else m.get('message_id')}",
-        flush=True,
-    )
+    if added or moved or not source_is_export:
+        print(
+            f"AUTO CATEGORIE ✅ origine={source_key} destination={dest_key} "
+            f"score={score} raison={reason} message={m.get('id') if source_is_export else m.get('message_id')}",
+            flush=True,
+        )
     return dest_key, score, reason
 
 
@@ -556,23 +646,25 @@ def backfill_catalog_from_export():
     touched_topics = set()
     unmapped_media = 0
 
-    with CATALOG_LOCK:
-        for m in messages:
-            if m.get("type") != "message":
-                continue
-            message_id = m.get("id")
-            kind = _export_message_kind(m)
-            if not isinstance(message_id, int) or not kind:
-                continue
+    # Garder le verrou uniquement pendant un message historique :
+    # les clients peuvent continuer à consulter le catalogue pendant l'import.
+    for m in messages:
+        if m.get("type") != "message":
+            continue
+        message_id = m.get("id")
+        kind = _export_message_kind(m)
+        if not isinstance(message_id, int) or not kind:
+            continue
 
-            topic_id = find_root(message_id)
-            if not isinstance(topic_id, int):
-                if kind in ("photo", "video"):
-                    unmapped_media += 1
-                continue
+        topic_id = find_root(message_id)
+        if not isinstance(topic_id, int):
+            if kind in ("photo", "video"):
+                unmapped_media += 1
+            continue
 
-            key = str(topic_id)
-            title = (topic_roots.get(topic_id) or "").strip() or f"Catalogue {topic_id}"
+        key = str(topic_id)
+        title = (topic_roots.get(topic_id) or "").strip() or f"Catalogue {topic_id}"
+        with CATALOG_LOCK:
             c = CATALOG.setdefault(key, {
                 "title": title,
                 "message_ids": [],
@@ -582,11 +674,8 @@ def backfill_catalog_from_export():
             })
             if not c.get("title") or str(c.get("title")).startswith("Nouveau catalogue "):
                 c["title"] = title
-
             ids = c.setdefault("message_ids", [])
             if message_id in ids:
-                # Même si l'article existait déjà, on peut maintenant améliorer
-                # son classement automatiquement grâce à son texte historique.
                 auto_place_message(m, key, kind, source_title=title, source_is_export=True)
                 continue
 
@@ -601,10 +690,13 @@ def backfill_catalog_from_export():
             added += 1
             auto_place_message(m, key, kind, source_title=title, source_is_export=True)
 
+    with CATALOG_LOCK:
         for key in touched_topics:
             CATALOG[key]["message_ids"].sort()
         if added:
             save_catalog()
+
+    rebuild_search_index_from_export(export_path)
 
     print(
         f"BACKFILL ✅ fichier={export_path} ajoutés={added} "
@@ -953,6 +1045,8 @@ def register_new_content(m):
         return False
 
     key = str(thread_id)
+    index_live_publication(m)
+
     with CATALOG_LOCK:
         if key not in CATALOG:
             CATALOG[key] = {
@@ -985,6 +1079,8 @@ def register_new_content(m):
     return True
 
 def register_topic_title(m):
+    if not is_source_message(m):
+        return False
     # Nouveau topic ou renommage de topic.
     created = m.get("forum_topic_created") or {}
     edited = m.get("forum_topic_edited") or {}
@@ -1023,7 +1119,7 @@ app = Flask(__name__, static_folder="web", static_url_path="")
 
 def api(method, **data):
     try:
-        r = requests.post(f"{API}/{method}", json=data, timeout=90)
+        r = telegram_session().post(f"{API}/{method}", json=data, timeout=(8, 35))
         j = r.json()
     except Exception as e:
         print("HTTP error:", method, repr(e), flush=True)
@@ -1032,18 +1128,51 @@ def api(method, **data):
         print("Telegram error:", method, j, flush=True)
     return j
 
+def copy_catalog_messages(chat_id, message_ids):
+    """copyMessages exige des IDs strictement croissants."""
+    ids = ordered_message_ids(message_ids)
+    if not ids:
+        return {"ok": False, "description": "Aucun message"}
+    source = SOURCE_CHAT_ID if SOURCE_CHAT_ID is not None else SOURCE_CHAT
+    response = api("copyMessages", chat_id=chat_id, from_chat_id=source, message_ids=ids)
+    if response.get("ok"):
+        return response
+    sent = 0
+    for mid in ids:
+        if api("copyMessage", chat_id=chat_id, from_chat_id=source, message_id=mid).get("ok"):
+            sent += 1
+        else:
+            time.sleep(0.08)
+    return {"ok": True, "copied": sent, "partial": sent != len(ids)} if sent else response
+
+
+@app.get("/health")
+def health():
+    seconds_since_poll = time.monotonic() - POLL_LAST_OK
+    alive = POLL_WORKER is not None and POLL_WORKER.is_alive()
+    ok = alive and seconds_since_poll < 125
+    return jsonify({
+        "ok": ok, "version": "V6", "polling_alive": alive,
+        "last_poll_seconds_ago": int(seconds_since_poll),
+        "source_connected": SOURCE_CHAT_ID is not None,
+        "uptime_seconds": int(time.monotonic() - STARTED_AT)
+    }), 200 if ok else 503
+
+
 def catalog_totals():
-    topics = len(CATALOG)
-    items = sum(len(c.get("message_ids", [])) for c in CATALOG.values())
-    photos = sum(int(c.get("photos", 0)) for c in CATALOG.values())
-    videos = sum(int(c.get("videos", 0)) for c in CATALOG.values())
+    with CATALOG_LOCK:
+        values = list(CATALOG.values())
+        topics = len(values)
+        items = sum(len(c.get("message_ids", [])) for c in values)
+        photos = sum(int(c.get("photos", 0)) for c in values)
+        videos = sum(int(c.get("videos", 0)) for c in values)
     return topics, items, photos, videos
 
 def send_start(chat_id):
     topics, items, photos, videos = catalog_totals()
     caption = (
         "✨ <b>LE COIN MALIN 34 — CATALOGUE OFFICIEL</b> 🖤💛\n\n"
-        "Bienvenue 👋 Découvrez nos produits, photos et vidéos directement depuis le catalogue.\n\n"
+        "Bienvenue 👋 Explorez notre catalogue de photos et vidéos par catégorie, marque ou modèle.\n\n"
         "🆕 <b>Nouveautés</b> : les derniers articles ajoutés\n"
         "📦 <b>Sur place</b> : les produits disponibles immédiatement\n"
         "🚚 <b>Prêts à expédier</b> : accès rapide aux produits concernés\n\n"
@@ -1052,6 +1181,7 @@ def send_start(chat_id):
         "👇 <b>Choisissez une rubrique :</b>"
     )
     rows = [
+        [{"text":"🔎  Rechercher un produit / une marque","callback_data":"find:all"}],
         [{"text":"🆕  Nouveautés","callback_data":"new:0"}],
         [{"text":"📦  Articles disponibles sur place","callback_data":"articlesplace"}],
         [{"text":"👟  Chaussures","callback_data":"group:shoes"}],
@@ -1060,7 +1190,6 @@ def send_start(chat_id):
         [{"text":"⌚  Montres & Bijoux","callback_data":"group:watches"}],
         [{"text":"👜  Accessoires","callback_data":"group:accessories"}],
         [{"text":"🚚  Produits prêts à être expédiés","callback_data":"group:ready"}],
-        [{"text":"🛒  Commander / Comment ça marche","callback_data":"group:order"}],
         [{"text":"💬  Avis clients","callback_data":"group:reviews"}],
         [{"text":"📣  Voir le groupe LE COIN MALIN 34","url":SOURCE_GROUP_URL}],
         [{"text":"✨  Voir plus","callback_data":"group:more"}],
@@ -1068,15 +1197,29 @@ def send_start(chat_id):
     if WEBAPP_URL:
         rows.insert(1, [{"text":"🛍️  Catalogue Premium","web_app":{"url":WEBAPP_URL}}])
     kb = {"inline_keyboard": rows}
+    # Telegram file IDs avoid uploading the 600 KB logo on every /start.
+    if LOGO_CACHE_FILE.exists():
+        try:
+            cached_file_id = LOGO_CACHE_FILE.read_text(encoding="utf-8").strip()
+            if cached_file_id:
+                rr = api("sendPhoto", chat_id=chat_id, photo=cached_file_id,
+                         caption=caption, parse_mode="HTML", reply_markup=kb)
+                if rr.get("ok"):
+                    return rr
+        except Exception as e:
+            print("LOGO CACHE:", repr(e), flush=True)
     try:
         logo_path = "web/logo.png" if os.path.exists("web/logo.png") else "logo.png"
         with open(logo_path, "rb") as f:
-            rr = requests.post(f"{API}/sendPhoto", data={
+            rr = telegram_session().post(f"{API}/sendPhoto", data={
                 "chat_id": str(chat_id), "caption": caption, "parse_mode": "HTML",
                 "reply_markup": json.dumps(kb, ensure_ascii=False)
-            }, files={"photo": ("logo.png", f, "image/png")}, timeout=90).json()
-            if rr.get("ok"):
-                return rr
+            }, files={"photo": ("logo.png", f, "image/png")}, timeout=(8, 35)).json()
+        if rr.get("ok"):
+            sizes = (rr.get("result") or {}).get("photo") or []
+            if sizes and sizes[-1].get("file_id"):
+                LOGO_CACHE_FILE.write_text(sizes[-1]["file_id"], encoding="utf-8")
+            return rr
     except Exception as e:
         print("sendPhoto local error:", repr(e), flush=True)
     return api("sendMessage", chat_id=chat_id, text=caption, parse_mode="HTML", reply_markup=kb)
@@ -1096,24 +1239,18 @@ def send_new_page(chat_id, offset=0):
     if not page:
         return api("sendMessage", chat_id=chat_id, text="ℹ️ Aucune nouveauté pour le moment.",
                    reply_markup={"inline_keyboard":[[{"text":"🏠 Accueil","callback_data":"home"}]]})
-    # copyMessages respecte l’ordre fourni ; nouveautés = plus récent d’abord.
+    # Telegram exige une copie dans l'ordre croissant, même pour la page Nouveautés.
     api("sendMessage", chat_id=chat_id,
         text=f"🆕 <b>NOUVEAUTÉS</b>\nLes {len(page)} dernières publications du catalogue 👇",
         parse_mode="HTML")
-    res = api("copyMessages", chat_id=chat_id, from_chat_id=SOURCE_CHAT, message_ids=page)
-    if not res.get("ok"):
-        # Certains clients Telegram/API préfèrent un ordre croissant : repli robuste.
-        res = api("copyMessages", chat_id=chat_id, from_chat_id=SOURCE_CHAT, message_ids=sorted(page))
+    res = copy_catalog_messages(chat_id, page)
     nav=[]
     if offset > 0:
         nav.append({"text":"⬅️ Plus récentes","callback_data":f"new:{max(0,offset-PAGE_SIZE)}"})
     if offset + PAGE_SIZE < len(ids):
         nav.append({"text":"Plus anciennes ➡️","callback_data":f"new:{offset+PAGE_SIZE}"})
     rows=[nav] if nav else []
-    rows.append([
-        {"text":"🛒 Commander","url":ORDER_URL},
-        {"text":"💬 Avis clients","url":REVIEWS_URL}
-    ])
+    rows.append([{"text":"💬 Avis clients","url":REVIEWS_URL}])
     rows.append([{"text":"🏠 Accueil","callback_data":"home"}])
     return api("sendMessage", chat_id=chat_id, text="✨ <b>Catalogue actualisé automatiquement</b>",
                parse_mode="HTML", reply_markup={"inline_keyboard":rows})
@@ -1217,11 +1354,112 @@ def group_keyboard(group_id):
             suffix += f" · 🎬 {v}"
         if t:
             suffix += f" · 📝 {t}"
-        callback = f"cat:{tid}:0"
+        callback = f"topic:{tid}"
         rows.append([{"text":f"{clean_title(c['title'])}  |  {suffix}","callback_data":callback}])
 
+    rows.append([{"text":"🔎 Chercher dans cette rubrique","callback_data":f"findgroup:{group_id}"}])
     rows.append([{"text":"🏠 Accueil","callback_data":"home"}])
     return {"inline_keyboard":rows}
+
+
+def search_catalog_ids(scope):
+    """Return deduplicated catalog IDs from a topic, group, or whole catalog."""
+    if scope == "all":
+        buckets = CATALOG.values()
+    elif str(scope).startswith("group/"):
+        group_id = str(scope).split("/", 1)[1]
+        group = next((g for g in MENU["groups"] if g["id"] == group_id), None)
+        buckets = [(CATALOG.get(tid) or {}) for tid in topics_for_group(group)] if group else []
+    else:
+        buckets = [CATALOG.get(str(scope)) or {}]
+    return sorted(set(mid for bucket in buckets
+                      for mid in bucket.get("message_ids", [])
+                      if isinstance(mid, int)), reverse=True)
+
+
+def send_topic_menu(chat_id, topic_id, offset=0):
+    topic_id = str(topic_id)
+    cat = CATALOG.get(topic_id)
+    if not cat:
+        return api("sendMessage", chat_id=chat_id, text="Cette rubrique est introuvable.")
+    ids = search_catalog_ids(topic_id)
+    brands = brands_for_ids(ids, SEARCH_INDEX)
+    offset = max(0, min(int(offset), len(brands)))
+    title = clean_title(cat.get("title", "Catalogue"))
+    rows = []
+    for brand, count in brands[offset:offset+14]:
+        idx = BRANDS.index(brand)
+        rows.append([{"text":f"🏷️ {brand}  ({count})", "callback_data":f"ub:{topic_id}:{idx}:0"}])
+    nav = []
+    if offset > 0:
+        nav.append({"text":"⬅️ Marques", "callback_data":f"topic:{topic_id}:{max(0,offset-14)}"})
+    if offset + 14 < len(brands):
+        nav.append({"text":"Marques ➡️", "callback_data":f"topic:{topic_id}:{offset+14}"})
+    if nav:
+        rows.append(nav)
+    rows.append([{"text":"🔎 Rechercher un article / modèle", "callback_data":f"find:{topic_id}"}])
+    rows.append([{"text":f"📷 Tous les articles ({len(ids)})", "callback_data":f"cat:{topic_id}:0"}])
+    group_id = group_for_topic(topic_id)
+    if group_id:
+        rows.append([{"text":"⬅️ Rubriques", "callback_data":f"group:{group_id}"}])
+    rows.append([{"text":"🏠 Accueil", "callback_data":"home"}])
+    note = ("Choisissez une marque ou recherchez un modèle précis."
+            if brands else
+            "Aucune marque identifiée dans les légendes ; utilisez la recherche ou 'Tous les articles'.")
+    return api("sendMessage", chat_id=chat_id,
+        text=f"📁 <b>{title}</b>\n📦 {len(ids)} publications\n\n{note}",
+        parse_mode="HTML", reply_markup={"inline_keyboard":rows})
+
+
+def send_search_page(chat_id, offset=0):
+    label, ids = SEARCH_RESULTS.get(chat_id, ("", []))
+    if not ids:
+        return api("sendMessage", chat_id=chat_id,
+            text="🔎 Aucun résultat dans les légendes indexées. Essayez une autre orthographe ou consultez les catégories.",
+            reply_markup={"inline_keyboard":[
+                [{"text":"🔎 Nouvelle recherche", "callback_data":"find:all"}],
+                [{"text":"🏠 Accueil", "callback_data":"home"}]]})
+    offset = max(0, int(offset))
+    page = ids[offset:offset+PAGE_SIZE]
+    if not page:
+        return api("sendMessage", chat_id=chat_id, text="Fin des résultats.")
+    api("sendMessage", chat_id=chat_id,
+        text=f"🔎 <b>{label}</b>\nRésultats {offset+1}–{offset+len(page)} sur {len(ids)}",
+        parse_mode="HTML")
+    result = copy_catalog_messages(chat_id, page)
+    if not result.get("ok"):
+        api("sendMessage", chat_id=chat_id, text="⚠️ Certains messages ne sont plus accessibles.")
+    nav = []
+    if offset:
+        nav.append({"text":"⬅️ Précédents", "callback_data":f"sr:{max(0,offset-PAGE_SIZE)}"})
+    if offset + PAGE_SIZE < len(ids):
+        nav.append({"text":"Suivants ➡️", "callback_data":f"sr:{offset+PAGE_SIZE}"})
+    rows = ([nav] if nav else []) + [
+        [{"text":"🔎 Autre recherche", "callback_data":"find:all"}],
+        [{"text":"🏠 Accueil", "callback_data":"home"}]]
+    return api("sendMessage", chat_id=chat_id,
+        text=f"✅ {offset + len(page)} / {len(ids)}",
+        reply_markup={"inline_keyboard":rows})
+
+
+def send_brand_filter(chat_id, tid, idx, offset=0):
+    tid = str(tid)
+    if tid not in CATALOG or not 0 <= idx < len(BRANDS):
+        return api("sendMessage", chat_id=chat_id, text="Filtre indisponible.")
+    brand = BRANDS[idx]
+    ids = ids_for_brand(search_catalog_ids(tid), SEARCH_INDEX, brand)
+    SEARCH_RESULTS[chat_id] = (f"{brand} — {clean_title(CATALOG[tid]['title'])}", ids)
+    return send_search_page(chat_id, offset)
+
+
+def handle_search_text(chat_id, query):
+    scope = SEARCH_SCOPES.pop(chat_id, "all")
+    ids = search_ids(search_catalog_ids(scope), SEARCH_INDEX, query)
+    name = query[:80]
+    SEARCH_RESULTS[chat_id] = (name, ids)
+    return send_search_page(chat_id)
+
+
 
 def brand_keyboard(tid):
     tid = str(tid)
@@ -1487,7 +1725,7 @@ def send_page(chat_id, tid, offset=0):
         text=f"✨ <b>{title}</b>\n📷 {p} photos  ·  🎬 {v} vidéos  ·  📝 {t} textes\n\nAffichage {offset+1}–{end} sur {total}",
         parse_mode="HTML")
 
-    res=api("copyMessages", chat_id=chat_id, from_chat_id=SOURCE_CHAT, message_ids=page)
+    res=copy_catalog_messages(chat_id, page)
     if not res.get("ok"):
         return api("sendMessage", chat_id=chat_id,
                    text=f"⚠️ Telegram n’a pas pu copier ces médias.\n<code>{res.get('description','Erreur inconnue')}</code>",
@@ -1499,10 +1737,7 @@ def send_page(chat_id, tid, offset=0):
     if end<total:
         nav.append({"text":"Suivants ➡️","callback_data":f"cat:{tid}:{end}"})
     rows=[nav] if nav else []
-    rows.append([
-        {"text":"🛒 Commander","url":ORDER_URL},
-        {"text":"💬 Avis clients","url":REVIEWS_URL}
-    ])
+    rows.append([{"text":"💬 Avis clients","url":REVIEWS_URL}])
     rows.append([{"text":"🏠 Accueil","callback_data":"home"}])
     api("sendMessage", chat_id=chat_id,
         text=f"✅ <b>{end} / {total} éléments affichés</b>",
@@ -1510,16 +1745,8 @@ def send_page(chat_id, tid, offset=0):
 
 
 def _index_owner_ok(chat_id):
-    """Premier utilisateur qui lance /indeximages devient propriétaire de l'indexation."""
-    try:
-        if INDEX_OWNER_FILE and INDEX_OWNER_FILE.exists():
-            return INDEX_OWNER_FILE.read_text(encoding="utf-8").strip() == str(chat_id)
-        if INDEX_OWNER_FILE:
-            INDEX_OWNER_FILE.parent.mkdir(parents=True, exist_ok=True)
-            INDEX_OWNER_FILE.write_text(str(chat_id), encoding="utf-8")
-        return True
-    except Exception:
-        return True
+    """Seuls les identifiants ADMIN_USER_ID explicites accèdent aux scans."""
+    return is_admin_user(chat_id, ADMIN_IDS)
 
 def _clear_previous_shoe_index():
     """Supprime les anciens classements chaussures avant une analyse complète."""
@@ -1546,6 +1773,10 @@ def handle(u):
     if pm and (pm.get("chat") or {}).get("type") == "private":
         txt = pm.get("text", "")
         chat_id = pm["chat"]["id"]
+
+        # V7 : recherche universelle dans toutes les rubriques.
+        if chat_id in SEARCH_SCOPES and txt and not txt.startswith("/"):
+            return handle_search_text(chat_id, txt.strip()[:120])
 
         # V5 : réponse à la recherche marque/modèle
         if chat_id in SEARCH_WAITING and txt and not txt.startswith("/"):
@@ -1593,7 +1824,10 @@ def handle(u):
             return
 
         if txt.startswith("/cancel"):
+            SEARCH_SCOPES.pop(chat_id, None)
             SEARCH_WAITING.pop(chat_id, None)
+            if not _index_owner_ok(chat_id):
+                return api("sendMessage", chat_id=chat_id, text="✅ Recherche annulée.")
             stopped = []
             with INDEXING_LOCK:
                 for tid in list(INDEXING_TOPICS):
@@ -1607,8 +1841,24 @@ def handle(u):
                 )
             return api("sendMessage", chat_id=chat_id, text="✅ Recherche annulée.")
 
+        if txt.startswith("/recherche"):
+            SEARCH_SCOPES[chat_id] = "all"
+            SEARCH_WAITING.pop(chat_id, None)
+            return api("sendMessage", chat_id=chat_id,
+                text="🔎 <b>Recherche dans TOUT le catalogue</b>\n\nTapez un produit, une marque ou un modèle : Nike, Dior, doudoune, iPhone 16, parfum...\n\n/cancel pour annuler.",
+                parse_mode="HTML")
         if txt.startswith(("/start", "/menu")):
-            return send_start(pm["chat"]["id"])
+            return send_start(chat_id)
+        if txt.startswith("/ping"):
+            return api("sendMessage", chat_id=chat_id,
+                text=f"✅ Bot Telegram actif — V6\n⏱️ En ligne depuis : {format_uptime(time.monotonic() - STARTED_AT)}")
+        if txt.startswith("/id"):
+            return api("sendMessage", chat_id=chat_id,
+                text=f"🪪 Votre identifiant Telegram : <code>{chat_id}</code>\nÀ mettre dans ADMIN_USER_ID sur votre hébergement.",
+                parse_mode="HTML")
+        if txt.startswith("/help"):
+            return api("sendMessage", chat_id=chat_id,
+                text="🖤💛 LE COIN MALIN 34\n/start — Catalogue\n/menu — Accueil\n/recherche — Recherche globale\n/id — Mon identifiant\n/ping — Test\n/status — Synchronisation\n/cancel — Annuler")
         if txt.startswith("/status"):
             total_new = 0
             runtime = RUNTIME_CATALOG.exists()
@@ -1641,6 +1891,30 @@ def handle(u):
     d = q.get("data", "")
     if d == "home":
         return send_start(chat_id)
+    if d == "find:all" or d.startswith("find:") or d.startswith("findgroup:"):
+        scope = ("group/" + d.split(":", 1)[1]) if d.startswith("findgroup:") else d.split(":", 1)[1]
+        SEARCH_WAITING.pop(chat_id, None)
+        SEARCH_SCOPES[chat_id] = scope
+        return api("sendMessage", chat_id=chat_id,
+            text="🔎 <b>RECHERCHE</b>\n\nEnvoyez une marque, un modèle ou un article (ex. Nike, doudoune, Prada, AirPods).\n\n/cancel pour annuler.",
+            parse_mode="HTML")
+    if d.startswith("topic:"):
+        parts = d.split(":")
+        try:
+            return send_topic_menu(chat_id, parts[1], int(parts[2]) if len(parts) > 2 else 0)
+        except (ValueError, IndexError):
+            return api("sendMessage", chat_id=chat_id, text="Rubrique invalide.")
+    if d.startswith("ub:"):
+        try:
+            _, tid, idx, off = d.split(":", 3)
+            return send_brand_filter(chat_id, tid, int(idx), int(off))
+        except (ValueError, IndexError):
+            return api("sendMessage", chat_id=chat_id, text="Filtre invalide.")
+    if d.startswith("sr:"):
+        try:
+            return send_search_page(chat_id, int(d.split(":",1)[1]))
+        except ValueError:
+            return send_search_page(chat_id, 0)
     if d.startswith("new:"):
         try:
             return send_new_page(chat_id, int(d.split(":", 1)[1]))
@@ -1658,6 +1932,8 @@ def handle(u):
                 reply_markup=group_keyboard(gid)
             )
     if d.startswith("cancelscan:"):
+        if not _index_owner_ok(chat_id):
+            return api("sendMessage", chat_id=chat_id, text="⛔ Réservé à l'administrateur.")
         tid = d.split(":", 1)[1]
         with INDEXING_LOCK:
             if tid in INDEXING_TOPICS:
@@ -1672,7 +1948,7 @@ def handle(u):
             text="📦 <b>Articles disponibles sur place</b>\n\nChoisissez :",
             parse_mode="HTML",
             reply_markup={"inline_keyboard":[
-                [{"text":"🔎 Rechercher un article","callback_data":"searchbrand:2"}],
+                [{"text":"🔎 Rechercher un article","callback_data":"find:2"}],
                 [{"text":"📦 Voir tous les articles","callback_data":"cat:2:0"}],
                 [{"text":"🏠 Accueil","callback_data":"home"}]
             ]}
@@ -1799,56 +2075,93 @@ def start_background_index(chat_id, tid, force_image=False, silent_start=False):
         ]]}
     )
 
-def poll():
-    offset=0
+def _update_worker(lane):
+    """Private messages stay responsive even during a large catalog import."""
     while True:
         try:
-            resp = requests.get(
+            item = INBOX.next(lane)
+            if item is None:
+                time.sleep(0.20)
+                continue
+            update_id, update = item
+            try:
+                handle(update)
+            except Exception as exc:
+                print(f"UPDATE WORKER error lane={lane} id={update_id}: {exc!r}", flush=True)
+                INBOX.failed(update_id, repr(exc))
+            else:
+                INBOX.done(update_id)
+        except Exception as exc:
+            print(f"UPDATE WORKER storage error lane={lane}: {exc!r}", flush=True)
+            time.sleep(3)
+
+
+def _historical_backfill_worker():
+    """Never block /start while historical Telegram exports are analyzed."""
+    configured = os.environ.get("TELEGRAM_EXPORT_JSON", "").strip()
+    candidates = ([Path(configured)] if configured else []) + [
+        Path("result.json"), Path("result(2).json"),
+    ]
+    export_path = next((path for path in candidates if path.is_file()), None)
+    if export_path is None:
+        print("BACKFILL: aucun export historique ; les nouveaux posts restent synchronises", flush=True)
+        return
+    if not should_run_backfill(
+        BACKFILL_STATE_FILE, export_path, RUNTIME_CATALOG, SEARCH_INDEX_FILE
+    ):
+        print("BACKFILL CACHE ✅ ancien export deja indexe", flush=True)
+        return
+    try:
+        report = backfill_catalog_from_export()
+        if report.get("file"):
+            mark_backfill_complete(BACKFILL_STATE_FILE, export_path)
+    except Exception as exc:
+        print(f"BACKFILL worker error: {exc!r}", flush=True)
+
+
+def poll():
+    global POLL_LAST_OK
+    offset = INBOX.accepted_offset()
+    while True:
+        try:
+            response = telegram_session().get(
                 f"{API}/getUpdates",
                 params={
-                    "timeout": 50,
+                    "timeout": 25,
                     "offset": offset,
+                    "limit": 100,
                     "allowed_updates": json.dumps([
                         "message", "edited_message", "callback_query",
                         "channel_post", "edited_channel_post"
                     ])
                 },
-                timeout=60
+                timeout=(8, 35)
             )
             try:
-                r = resp.json()
+                payload = response.json()
             except Exception:
-                r = {"ok": False, "description": resp.text[:500]}
-
-            if not r.get("ok"):
-                # Telegram renvoie notamment 409 lorsqu'un autre processus
-                # utilise déjà getUpdates avec le même token. Sans ce log,
-                # le bot semble démarré mais ne répond jamais aux messages.
+                payload = {"ok": False, "description": response.text[:500]}
+            if not payload.get("ok"):
                 print(
-                    f"TELEGRAM getUpdates ERROR HTTP={resp.status_code} "
-                    f"payload={r}",
+                    f"TELEGRAM getUpdates ERROR HTTP={response.status_code} "
+                    f"payload={payload}",
                     flush=True
                 )
                 time.sleep(5)
                 continue
-
-            updates = r.get("result", []) or []
+            updates = payload.get("result", []) or []
             if updates:
-                print(f"TELEGRAM UPDATES: {len(updates)}", flush=True)
-            for u in updates:
-                offset=u["update_id"]+1
-                try:
-                    handle(u)
-                except Exception as e:
-                    print(
-                        f"TELEGRAM UPDATE ERROR id={u.get('update_id')}: {e!r}",
-                        flush=True
-                    )
-        except Exception as e:
-            print("Polling NETWORK ERROR:",repr(e),flush=True)
+                # Commit to SQLite before acknowledgement on the next getUpdates.
+                offset = INBOX.store(updates)
+                print(f"TELEGRAM UPDATES queued={len(updates)} lanes={INBOX.pending()}", flush=True)
+            POLL_LAST_OK = time.monotonic()
+        except Exception as exc:
+            print(f"Polling NETWORK / QUEUE ERROR: {exc!r}", flush=True)
             time.sleep(3)
 
+
 def main():
+    global POLL_WORKER, INBOX
     if not TOKEN:
         raise SystemExit("BOT_TOKEN manquant : le bot Telegram ne peut pas démarrer")
 
@@ -1868,6 +2181,8 @@ def main():
         raise
     except Exception as e:
         raise SystemExit(f"Impossible de vérifier BOT_TOKEN auprès de Telegram: {e}")
+
+    resolve_source_chat_id()
 
     # Vérifie que le bot est bien présent dans le groupe source.
     # Sans accès au groupe, Telegram ne peut pas lui livrer les nouveaux messages.
@@ -1905,17 +2220,34 @@ def main():
     except Exception as e:
         print(f"TELEGRAM WEBHOOK RESET ERROR: {e!r}", flush=True)
 
-    resolve_source_chat_id()
-    backfill_catalog_from_export()
+    INBOX = DurableUpdateInbox(DATA_DIR / "telegram_updates.sqlite3")
     print(f"Catalogue dynamique: {RUNTIME_CATALOG}", flush=True)
     print(f"AUTO {BUILD_VERSION}: accueil amélioré + recherche chaussures supprimée + topics auto = ACTIVÉ", flush=True)
     print("MODE GRATUIT: VISION LOCALE CLIP + CACHE = ACTIVÉ", flush=True)
     print("TOPIC 2: Articles disponibles sur place = ACTIVÉ", flush=True)
     print("OPENAI API: NON UTILISÉE", flush=True)
     print(f"MODÈLE LOCAL: {LOCAL_VISION_MODEL}", flush=True)
-    threading.Thread(target=poll,daemon=True).start()
-    port=int(os.environ.get("PORT","8080"))
-    app.run(host="0.0.0.0",port=port,threaded=True)
+    if not ADMIN_IDS:
+        print("SECURITE: ADMIN_USER_ID absent, scans admin desactives", flush=True)
+    for lane in ("private", "catalog"):
+        worker = threading.Thread(
+            target=_update_worker, args=(lane,), daemon=True,
+            name=f"telegram-worker-{lane}"
+        )
+        worker.start()
+        UPDATE_WORKERS.append(worker)
+    POLL_WORKER = threading.Thread(target=poll, daemon=True, name="telegram-poll")
+    POLL_WORKER.start()
+    threading.Thread(target=_historical_backfill_worker, daemon=True,
+                     name="telegram-history").start()
+
+    # A Telegram catalog worker does not need a public web server on a VM.
+    if os.environ.get("BOT_ONLY", "").strip().lower() in {"1", "true", "yes"}:
+        print("BOT_ONLY: aucun site web demarre, bot Telegram actif", flush=True)
+        while True:
+            time.sleep(60)
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
 
 if __name__=="__main__":
     main()
