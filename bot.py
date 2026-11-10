@@ -1,6 +1,10 @@
 import json, os, time, threading, requests, io, gc
 from flask import Flask, send_from_directory, jsonify
 from bot_v6 import configured_admin_ids, is_admin_user, env_int, ordered_message_ids, format_uptime
+from bot_v7_search import (
+    BRANDS, index_entry, index_export_messages, search_ids,
+    brands_for_ids, ids_for_brand, normalized,
+)
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
@@ -34,6 +38,9 @@ ADMIN_IDS = configured_admin_ids(os.environ.get("ADMIN_USER_ID", ""))
 STARTED_AT = time.monotonic()
 POLL_LAST_OK = STARTED_AT
 POLL_WORKER = None
+SEARCH_SCOPES = {}       # private_chat_id -> topic id or "all"
+SEARCH_RESULTS = {}      # private_chat_id -> (label, [message ids])
+SEARCH_INDEX_LOCK = threading.RLock()
 SOURCE_CHAT_ID = None
 BUILD_VERSION = "APP-V1-AUTO-CATEGORIES-NOUVEAUTES-HISTORIQUE"
 
@@ -137,6 +144,66 @@ CATALOG_LOCK = RLock()
 BASE_BRANDS = Path("brand_catalog.json")
 RUNTIME_BRANDS = DATA_DIR / "brand_catalog_runtime.json"
 BRAND_LOCK = RLock()
+SEARCH_INDEX_FILE = DATA_DIR / "search_index_runtime.json"
+
+
+def _load_search_index():
+    if SEARCH_INDEX_FILE.exists():
+        try:
+            with SEARCH_INDEX_FILE.open(encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                return obj
+        except Exception as e:
+            print(f"SEARCH INDEX load error: {e!r}", flush=True)
+    return {}
+
+
+SEARCH_INDEX = _load_search_index()
+
+
+def save_search_index():
+    with SEARCH_INDEX_LOCK:
+        SEARCH_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SEARCH_INDEX_FILE.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(SEARCH_INDEX, f, ensure_ascii=False)
+        tmp.replace(SEARCH_INDEX)
+
+
+def index_live_publication(message):
+    mid = message.get("message_id")
+    if not isinstance(mid, int):
+        return
+    entry = index_entry(message)
+    if entry is None:
+        return
+    with SEARCH_INDEX_LOCK:
+        if SEARCH_INDEX.get(str(mid)) != entry:
+            SEARCH_INDEX[str(mid)] = entry
+            save_search_index()
+
+
+def rebuild_search_index_from_export(export_path):
+    try:
+        with open(export_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        records = index_export_messages(payload.get("messages") or [])
+        if not records:
+            return 0
+        changed = 0
+        with SEARCH_INDEX_LOCK:
+            for mid, entry in records.items():
+                if SEARCH_INDEX.get(mid) != entry:
+                    SEARCH_INDEX[mid] = entry
+                    changed += 1
+            if changed:
+                save_search_index()
+        print(f"SEARCH INDEX ✅ fichiers={len(records)} ajoutes_ou_maj={changed}", flush=True)
+        return changed
+    except Exception as e:
+        print(f"SEARCH INDEX export error: {e!r}", flush=True)
+        return 0
 
 def _load_brands():
     source = RUNTIME_BRANDS if RUNTIME_BRANDS.exists() else BASE_BRANDS
@@ -611,6 +678,8 @@ def backfill_catalog_from_export():
         if added:
             save_catalog()
 
+    rebuild_search_index_from_export(export_path)
+
     print(
         f"BACKFILL ✅ fichier={export_path} ajoutés={added} "
         f"topics={len(touched_topics)} médias_sans_topic={unmapped_media}",
@@ -958,6 +1027,8 @@ def register_new_content(m):
         return False
 
     key = str(thread_id)
+    index_live_publication(m)
+
     with CATALOG_LOCK:
         if key not in CATALOG:
             CATALOG[key] = {
@@ -1088,6 +1159,7 @@ def send_start(chat_id):
         "👇 <b>Choisissez une rubrique :</b>"
     )
     rows = [
+        [{"text":"🔎  Rechercher un produit / une marque","callback_data":"find:all"}],
         [{"text":"🆕  Nouveautés","callback_data":"new:0"}],
         [{"text":"📦  Articles disponibles sur place","callback_data":"articlesplace"}],
         [{"text":"👟  Chaussures","callback_data":"group:shoes"}],
@@ -1250,11 +1322,112 @@ def group_keyboard(group_id):
             suffix += f" · 🎬 {v}"
         if t:
             suffix += f" · 📝 {t}"
-        callback = f"cat:{tid}:0"
+        callback = f"topic:{tid}"
         rows.append([{"text":f"{clean_title(c['title'])}  |  {suffix}","callback_data":callback}])
 
+    rows.append([{"text":"🔎 Chercher dans cette rubrique","callback_data":f"findgroup:{group_id}"}])
     rows.append([{"text":"🏠 Accueil","callback_data":"home"}])
     return {"inline_keyboard":rows}
+
+
+def search_catalog_ids(scope):
+    """Return deduplicated catalog IDs from a topic, group, or whole catalog."""
+    if scope == "all":
+        buckets = CATALOG.values()
+    elif str(scope).startswith("group/"):
+        group_id = str(scope).split("/", 1)[1]
+        group = next((g for g in MENU["groups"] if g["id"] == group_id), None)
+        buckets = [(CATALOG.get(tid) or {}) for tid in topics_for_group(group)] if group else []
+    else:
+        buckets = [CATALOG.get(str(scope)) or {}]
+    return sorted(set(mid for bucket in buckets
+                      for mid in bucket.get("message_ids", [])
+                      if isinstance(mid, int)), reverse=True)
+
+
+def send_topic_menu(chat_id, topic_id, offset=0):
+    topic_id = str(topic_id)
+    cat = CATALOG.get(topic_id)
+    if not cat:
+        return api("sendMessage", chat_id=chat_id, text="Cette rubrique est introuvable.")
+    ids = search_catalog_ids(topic_id)
+    brands = brands_for_ids(ids, SEARCH_INDEX)
+    offset = max(0, min(int(offset), len(brands)))
+    title = clean_title(cat.get("title", "Catalogue"))
+    rows = []
+    for brand, count in brands[offset:offset+14]:
+        idx = BRANDS.index(brand)
+        rows.append([{"text":f"🏷️ {brand}  ({count})", "callback_data":f"ub:{topic_id}:{idx}:0"}])
+    nav = []
+    if offset > 0:
+        nav.append({"text":"⬅️ Marques", "callback_data":f"topic:{topic_id}:{max(0,offset-14)}"})
+    if offset + 14 < len(brands):
+        nav.append({"text":"Marques ➡️", "callback_data":f"topic:{topic_id}:{offset+14}"})
+    if nav:
+        rows.append(nav)
+    rows.append([{"text":"🔎 Rechercher un article / modèle", "callback_data":f"find:{topic_id}"}])
+    rows.append([{"text":f"📷 Tous les articles ({len(ids)})", "callback_data":f"cat:{topic_id}:0"}])
+    group_id = group_for_topic(topic_id)
+    if group_id:
+        rows.append([{"text":"⬅️ Rubriques", "callback_data":f"group:{group_id}"}])
+    rows.append([{"text":"🏠 Accueil", "callback_data":"home"}])
+    note = ("Choisissez une marque ou recherchez un modèle précis."
+            if brands else
+            "Aucune marque identifiée dans les légendes ; utilisez la recherche ou 'Tous les articles'.")
+    return api("sendMessage", chat_id=chat_id,
+        text=f"📁 <b>{title}</b>\n📦 {len(ids)} publications\n\n{note}",
+        parse_mode="HTML", reply_markup={"inline_keyboard":rows})
+
+
+def send_search_page(chat_id, offset=0):
+    label, ids = SEARCH_RESULTS.get(chat_id, ("", []))
+    if not ids:
+        return api("sendMessage", chat_id=chat_id,
+            text="🔎 Aucun résultat dans les légendes indexées. Essayez une autre orthographe ou consultez les catégories.",
+            reply_markup={"inline_keyboard":[
+                [{"text":"🔎 Nouvelle recherche", "callback_data":"find:all"}],
+                [{"text":"🏠 Accueil", "callback_data":"home"}]]})
+    offset = max(0, int(offset))
+    page = ids[offset:offset+PAGE_SIZE]
+    if not page:
+        return api("sendMessage", chat_id=chat_id, text="Fin des résultats.")
+    api("sendMessage", chat_id=chat_id,
+        text=f"🔎 <b>{label}</b>\nRésultats {offset+1}–{offset+len(page)} sur {len(ids)}",
+        parse_mode="HTML")
+    result = copy_catalog_messages(chat_id, page)
+    if not result.get("ok"):
+        api("sendMessage", chat_id=chat_id, text="⚠️ Certains messages ne sont plus accessibles.")
+    nav = []
+    if offset:
+        nav.append({"text":"⬅️ Précédents", "callback_data":f"sr:{max(0,offset-PAGE_SIZE)}"})
+    if offset + PAGE_SIZE < len(ids):
+        nav.append({"text":"Suivants ➡️", "callback_data":f"sr:{offset+PAGE_SIZE}"})
+    rows = ([nav] if nav else []) + [
+        [{"text":"🔎 Autre recherche", "callback_data":"find:all"}],
+        [{"text":"🏠 Accueil", "callback_data":"home"}]]
+    return api("sendMessage", chat_id=chat_id,
+        text=f"✅ {offset + len(page)} / {len(ids)}",
+        reply_markup={"inline_keyboard":rows})
+
+
+def send_brand_filter(chat_id, tid, idx, offset=0):
+    tid = str(tid)
+    if tid not in CATALOG or not 0 <= idx < len(BRANDS):
+        return api("sendMessage", chat_id=chat_id, text="Filtre indisponible.")
+    brand = BRANDS[idx]
+    ids = ids_for_brand(search_catalog_ids(tid), SEARCH_INDEX, brand)
+    SEARCH_RESULTS[chat_id] = (f"{brand} — {clean_title(CATALOG[tid]['title'])}", ids)
+    return send_search_page(chat_id, offset)
+
+
+def handle_search_text(chat_id, query):
+    scope = SEARCH_SCOPES.pop(chat_id, "all")
+    ids = search_ids(search_catalog_ids(scope), SEARCH_INDEX, query)
+    name = query[:80]
+    SEARCH_RESULTS[chat_id] = (name, ids)
+    return send_search_page(chat_id)
+
+
 
 def brand_keyboard(tid):
     tid = str(tid)
@@ -1572,6 +1745,10 @@ def handle(u):
         txt = pm.get("text", "")
         chat_id = pm["chat"]["id"]
 
+        # V7 : recherche universelle dans toutes les rubriques.
+        if chat_id in SEARCH_SCOPES and txt and not txt.startswith("/"):
+            return handle_search_text(chat_id, txt.strip()[:120])
+
         # V5 : réponse à la recherche marque/modèle
         if chat_id in SEARCH_WAITING and txt and not txt.startswith("/"):
             tid = SEARCH_WAITING.pop(chat_id)
@@ -1618,6 +1795,7 @@ def handle(u):
             return
 
         if txt.startswith("/cancel"):
+            SEARCH_SCOPES.pop(chat_id, None)
             SEARCH_WAITING.pop(chat_id, None)
             if not _index_owner_ok(chat_id):
                 return api("sendMessage", chat_id=chat_id, text="✅ Recherche annulée.")
@@ -1634,6 +1812,12 @@ def handle(u):
                 )
             return api("sendMessage", chat_id=chat_id, text="✅ Recherche annulée.")
 
+        if txt.startswith(("/start", "/menu", "/recherche")) and txt.startswith("/recherche"):
+            SEARCH_SCOPES[chat_id] = "all"
+            SEARCH_WAITING.pop(chat_id, None)
+            return api("sendMessage", chat_id=chat_id,
+                text="🔎 <b>Recherche dans TOUT le catalogue</b>\n\nTapez un produit, une marque ou un modèle : Nike, Dior, doudoune, iPhone 16, parfum...\n\n/cancel pour annuler.",
+                parse_mode="HTML")
         if txt.startswith(("/start", "/menu")):
             return send_start(chat_id)
         if txt.startswith("/ping"):
@@ -1641,7 +1825,7 @@ def handle(u):
                 text=f"✅ Bot Telegram actif — V6\n⏱️ En ligne depuis : {format_uptime(time.monotonic() - STARTED_AT)}")
         if txt.startswith("/help"):
             return api("sendMessage", chat_id=chat_id,
-                text="🖤💛 LE COIN MALIN 34\n/start — Catalogue\n/menu — Accueil\n/ping — Test\n/status — Synchronisation\n/cancel — Annuler")
+                text="🖤💛 LE COIN MALIN 34\n/start — Catalogue\n/menu — Accueil\n/recherche — Recherche globale\n/ping — Test\n/status — Synchronisation\n/cancel — Annuler")
         if txt.startswith("/status"):
             total_new = 0
             runtime = RUNTIME_CATALOG.exists()
@@ -1674,6 +1858,30 @@ def handle(u):
     d = q.get("data", "")
     if d == "home":
         return send_start(chat_id)
+    if d == "find:all" or d.startswith("find:") or d.startswith("findgroup:"):
+        scope = ("group/" + d.split(":", 1)[1]) if d.startswith("findgroup:") else d.split(":", 1)[1]
+        SEARCH_WAITING.pop(chat_id, None)
+        SEARCH_SCOPES[chat_id] = scope
+        return api("sendMessage", chat_id=chat_id,
+            text="🔎 <b>RECHERCHE</b>\n\nEnvoyez une marque, un modèle ou un article (ex. Nike, doudoune, Prada, AirPods).\n\n/cancel pour annuler.",
+            parse_mode="HTML")
+    if d.startswith("topic:"):
+        parts = d.split(":")
+        try:
+            return send_topic_menu(chat_id, parts[1], int(parts[2]) if len(parts) > 2 else 0)
+        except (ValueError, IndexError):
+            return api("sendMessage", chat_id=chat_id, text="Rubrique invalide.")
+    if d.startswith("ub:"):
+        try:
+            _, tid, idx, off = d.split(":", 3)
+            return send_brand_filter(chat_id, tid, int(idx), int(off))
+        except (ValueError, IndexError):
+            return api("sendMessage", chat_id=chat_id, text="Filtre invalide.")
+    if d.startswith("sr:"):
+        try:
+            return send_search_page(chat_id, int(d.split(":",1)[1]))
+        except ValueError:
+            return send_search_page(chat_id, 0)
     if d.startswith("new:"):
         try:
             return send_new_page(chat_id, int(d.split(":", 1)[1]))
