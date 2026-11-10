@@ -646,23 +646,25 @@ def backfill_catalog_from_export():
     touched_topics = set()
     unmapped_media = 0
 
-    with CATALOG_LOCK:
-        for m in messages:
-            if m.get("type") != "message":
-                continue
-            message_id = m.get("id")
-            kind = _export_message_kind(m)
-            if not isinstance(message_id, int) or not kind:
-                continue
+    # Garder le verrou uniquement pendant un message historique :
+    # les clients peuvent continuer à consulter le catalogue pendant l'import.
+    for m in messages:
+        if m.get("type") != "message":
+            continue
+        message_id = m.get("id")
+        kind = _export_message_kind(m)
+        if not isinstance(message_id, int) or not kind:
+            continue
 
-            topic_id = find_root(message_id)
-            if not isinstance(topic_id, int):
-                if kind in ("photo", "video"):
-                    unmapped_media += 1
-                continue
+        topic_id = find_root(message_id)
+        if not isinstance(topic_id, int):
+            if kind in ("photo", "video"):
+                unmapped_media += 1
+            continue
 
-            key = str(topic_id)
-            title = (topic_roots.get(topic_id) or "").strip() or f"Catalogue {topic_id}"
+        key = str(topic_id)
+        title = (topic_roots.get(topic_id) or "").strip() or f"Catalogue {topic_id}"
+        with CATALOG_LOCK:
             c = CATALOG.setdefault(key, {
                 "title": title,
                 "message_ids": [],
@@ -672,11 +674,8 @@ def backfill_catalog_from_export():
             })
             if not c.get("title") or str(c.get("title")).startswith("Nouveau catalogue "):
                 c["title"] = title
-
             ids = c.setdefault("message_ids", [])
             if message_id in ids:
-                # Même si l'article existait déjà, on peut maintenant améliorer
-                # son classement automatiquement grâce à son texte historique.
                 auto_place_message(m, key, kind, source_title=title, source_is_export=True)
                 continue
 
@@ -691,6 +690,7 @@ def backfill_catalog_from_export():
             added += 1
             auto_place_message(m, key, kind, source_title=title, source_is_export=True)
 
+    with CATALOG_LOCK:
         for key in touched_topics:
             CATALOG[key]["message_ids"].sort()
         if added:
