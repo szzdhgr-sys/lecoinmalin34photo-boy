@@ -73,3 +73,9 @@ python -m unittest discover -s tests -v
 Contrôler les logs : \`TELEGRAM BOT OK\`, \`SOURCE OK\`, \`SEARCH INDEX\`.
 Puis tester \`/ping\`, \`/start\`, \`/recherche\`, une marque dans chaque rubrique.
 Le diagnostic de la panne précédente exige toujours les logs de l'hébergeur.
+
+## Mode vitrine uniquement
+
+Le bot V7 sert uniquement à consulter les produits (photos/vidéos, catégories, marques, recherche). Il ne propose aucune prise de commande, aucun panier et aucun paiement. Les anciens messages du groupe peuvent contenir des informations historiques, mais les interfaces publiques du bot n'affichent pas de bouton « Commander ».
+
+La variable `ADMIN_USER_ID` est **facultative**. Sans cette variable, les fonctions de scan administrateur restent désactivées ; les visiteurs peuvent quand même utiliser les rubriques, filtres et recherches.
