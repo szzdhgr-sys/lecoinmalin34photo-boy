@@ -167,7 +167,7 @@ def save_search_index():
         tmp = SEARCH_INDEX_FILE.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(SEARCH_INDEX, f, ensure_ascii=False)
-        tmp.replace(SEARCH_INDEX)
+        tmp.replace(SEARCH_INDEX_FILE)
 
 
 def index_live_publication(message):
