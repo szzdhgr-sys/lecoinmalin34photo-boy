@@ -8,3 +8,5 @@ __pycache__/
 search_index_runtime.json
 catalog_runtime.json
 brand_catalog_runtime.json
+bot-private.cmd
+data/
