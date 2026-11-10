@@ -1,3 +1,10 @@
 .env
 __pycache__/
 *.pyc
+
+.env.local
+*.env.local
+.venv/
+search_index_runtime.json
+catalog_runtime.json
+brand_catalog_runtime.json
