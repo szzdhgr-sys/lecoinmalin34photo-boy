@@ -1,0 +1,21 @@
+[Unit]
+Description=LE COIN MALIN 34 - bot catalogue Telegram
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/lecoinmalin34-bot
+Environment=PYTHONUNBUFFERED=1
+Environment=BOT_ONLY=1
+Environment=DATA_DIR=/home/ubuntu/lecoinmalin34-bot/data
+EnvironmentFile=/home/ubuntu/lecoinmalin34-bot/private.env
+ExecStart=/home/ubuntu/lecoinmalin34-bot/.venv/bin/python /home/ubuntu/lecoinmalin34-bot/bot.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
