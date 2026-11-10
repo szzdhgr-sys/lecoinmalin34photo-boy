@@ -194,7 +194,7 @@ def rebuild_search_index_from_export(export_path):
         changed = 0
         with SEARCH_INDEX_LOCK:
             for mid, entry in records.items():
-                if SEARCH_INDEX.get(mid) != entry:
+                if mid not in SEARCH_INDEX:
                     SEARCH_INDEX[mid] = entry
                     changed += 1
             if changed:
@@ -1204,7 +1204,7 @@ def send_new_page(chat_id, offset=0):
     if not page:
         return api("sendMessage", chat_id=chat_id, text="ℹ️ Aucune nouveauté pour le moment.",
                    reply_markup={"inline_keyboard":[[{"text":"🏠 Accueil","callback_data":"home"}]]})
-    # copyMessages respecte l’ordre fourni ; nouveautés = plus récent d’abord.
+    # Telegram exige une copie dans l'ordre croissant, même pour la page Nouveautés.
     api("sendMessage", chat_id=chat_id,
         text=f"🆕 <b>NOUVEAUTÉS</b>\nLes {len(page)} dernières publications du catalogue 👇",
         parse_mode="HTML")
@@ -1812,7 +1812,7 @@ def handle(u):
                 )
             return api("sendMessage", chat_id=chat_id, text="✅ Recherche annulée.")
 
-        if txt.startswith(("/start", "/menu", "/recherche")) and txt.startswith("/recherche"):
+        if txt.startswith("/recherche"):
             SEARCH_SCOPES[chat_id] = "all"
             SEARCH_WAITING.pop(chat_id, None)
             return api("sendMessage", chat_id=chat_id,
@@ -1915,7 +1915,7 @@ def handle(u):
             text="📦 <b>Articles disponibles sur place</b>\n\nChoisissez :",
             parse_mode="HTML",
             reply_markup={"inline_keyboard":[
-                [{"text":"🔎 Rechercher un article","callback_data":"searchbrand:2"}],
+                [{"text":"🔎 Rechercher un article","callback_data":"find:2"}],
                 [{"text":"📦 Voir tous les articles","callback_data":"cat:2:0"}],
                 [{"text":"🏠 Accueil","callback_data":"home"}]
             ]}
