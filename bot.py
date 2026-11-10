@@ -1823,9 +1823,13 @@ def handle(u):
         if txt.startswith("/ping"):
             return api("sendMessage", chat_id=chat_id,
                 text=f"✅ Bot Telegram actif — V6\n⏱️ En ligne depuis : {format_uptime(time.monotonic() - STARTED_AT)}")
+        if txt.startswith("/id"):
+            return api("sendMessage", chat_id=chat_id,
+                text=f"🪪 Votre identifiant Telegram : <code>{chat_id}</code>\nÀ mettre dans ADMIN_USER_ID sur votre hébergement.",
+                parse_mode="HTML")
         if txt.startswith("/help"):
             return api("sendMessage", chat_id=chat_id,
-                text="🖤💛 LE COIN MALIN 34\n/start — Catalogue\n/menu — Accueil\n/recherche — Recherche globale\n/ping — Test\n/status — Synchronisation\n/cancel — Annuler")
+                text="🖤💛 LE COIN MALIN 34\n/start — Catalogue\n/menu — Accueil\n/recherche — Recherche globale\n/id — Mon identifiant\n/ping — Test\n/status — Synchronisation\n/cancel — Annuler")
         if txt.startswith("/status"):
             total_new = 0
             runtime = RUNTIME_CATALOG.exists()
