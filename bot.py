@@ -1,6 +1,9 @@
 import json, os, time, threading, requests, io, gc
 from flask import Flask, send_from_directory, jsonify
 from bot_v6 import configured_admin_ids, is_admin_user, env_int, ordered_message_ids, format_uptime
+from bot_runtime import (
+    DurableUpdateInbox, should_run_backfill, mark_backfill_complete
+)
 from bot_v7_search import (
     BRANDS, index_entry, index_export_messages, search_ids,
     brands_for_ids, ids_for_brand, normalized,
@@ -37,6 +40,19 @@ ADMIN_IDS = configured_admin_ids(os.environ.get("ADMIN_USER_ID", ""))
 STARTED_AT = time.monotonic()
 POLL_LAST_OK = STARTED_AT
 POLL_WORKER = None
+INBOX = None
+UPDATE_WORKERS = []
+HTTP_LOCAL = threading.local()
+
+
+def telegram_session():
+    # One persistent HTTP/TLS session per worker thread.
+    session = getattr(HTTP_LOCAL, "telegram_session", None)
+    if session is None:
+        session = requests.Session()
+        HTTP_LOCAL.telegram_session = session
+    return session
+
 SEARCH_SCOPES = {}       # private_chat_id -> topic id or "all"
 SEARCH_RESULTS = {}      # private_chat_id -> (label, [message ids])
 SEARCH_INDEX_LOCK = threading.RLock()
@@ -144,6 +160,8 @@ BASE_BRANDS = Path("brand_catalog.json")
 RUNTIME_BRANDS = DATA_DIR / "brand_catalog_runtime.json"
 BRAND_LOCK = RLock()
 SEARCH_INDEX_FILE = DATA_DIR / "search_index_runtime.json"
+BACKFILL_STATE_FILE = DATA_DIR / "last_backfill.json"
+LOGO_CACHE_FILE = DATA_DIR / "telegram_logo_file_id.txt"
 
 
 def _load_search_index():
@@ -556,11 +574,12 @@ def auto_place_message(m, original_topic, kind, source_title=None, source_is_exp
         if added or moved:
             save_catalog()
 
-    print(
-        f"AUTO CATEGORIE ✅ origine={source_key} destination={dest_key} "
-        f"score={score} raison={reason} message={m.get('id') if source_is_export else m.get('message_id')}",
-        flush=True,
-    )
+    if added or moved or not source_is_export:
+        print(
+            f"AUTO CATEGORIE ✅ origine={source_key} destination={dest_key} "
+            f"score={score} raison={reason} message={m.get('id') if source_is_export else m.get('message_id')}",
+            flush=True,
+        )
     return dest_key, score, reason
 
 
@@ -1060,6 +1079,8 @@ def register_new_content(m):
     return True
 
 def register_topic_title(m):
+    if not is_source_message(m):
+        return False
     # Nouveau topic ou renommage de topic.
     created = m.get("forum_topic_created") or {}
     edited = m.get("forum_topic_edited") or {}
@@ -1098,7 +1119,7 @@ app = Flask(__name__, static_folder="web", static_url_path="")
 
 def api(method, **data):
     try:
-        r = requests.post(f"{API}/{method}", json=data, timeout=90)
+        r = telegram_session().post(f"{API}/{method}", json=data, timeout=(8, 35))
         j = r.json()
     except Exception as e:
         print("HTTP error:", method, repr(e), flush=True)
@@ -1139,10 +1160,12 @@ def health():
 
 
 def catalog_totals():
-    topics = len(CATALOG)
-    items = sum(len(c.get("message_ids", [])) for c in CATALOG.values())
-    photos = sum(int(c.get("photos", 0)) for c in CATALOG.values())
-    videos = sum(int(c.get("videos", 0)) for c in CATALOG.values())
+    with CATALOG_LOCK:
+        values = list(CATALOG.values())
+        topics = len(values)
+        items = sum(len(c.get("message_ids", [])) for c in values)
+        photos = sum(int(c.get("photos", 0)) for c in values)
+        videos = sum(int(c.get("videos", 0)) for c in values)
     return topics, items, photos, videos
 
 def send_start(chat_id):
@@ -1174,15 +1197,29 @@ def send_start(chat_id):
     if WEBAPP_URL:
         rows.insert(1, [{"text":"🛍️  Catalogue Premium","web_app":{"url":WEBAPP_URL}}])
     kb = {"inline_keyboard": rows}
+    # Telegram file IDs avoid uploading the 600 KB logo on every /start.
+    if LOGO_CACHE_FILE.exists():
+        try:
+            cached_file_id = LOGO_CACHE_FILE.read_text(encoding="utf-8").strip()
+            if cached_file_id:
+                rr = api("sendPhoto", chat_id=chat_id, photo=cached_file_id,
+                         caption=caption, parse_mode="HTML", reply_markup=kb)
+                if rr.get("ok"):
+                    return rr
+        except Exception as e:
+            print("LOGO CACHE:", repr(e), flush=True)
     try:
         logo_path = "web/logo.png" if os.path.exists("web/logo.png") else "logo.png"
         with open(logo_path, "rb") as f:
-            rr = requests.post(f"{API}/sendPhoto", data={
+            rr = telegram_session().post(f"{API}/sendPhoto", data={
                 "chat_id": str(chat_id), "caption": caption, "parse_mode": "HTML",
                 "reply_markup": json.dumps(kb, ensure_ascii=False)
-            }, files={"photo": ("logo.png", f, "image/png")}, timeout=90).json()
-            if rr.get("ok"):
-                return rr
+            }, files={"photo": ("logo.png", f, "image/png")}, timeout=(8, 35)).json()
+        if rr.get("ok"):
+            sizes = (rr.get("result") or {}).get("photo") or []
+            if sizes and sizes[-1].get("file_id"):
+                LOGO_CACHE_FILE.write_text(sizes[-1]["file_id"], encoding="utf-8")
+            return rr
     except Exception as e:
         print("sendPhoto local error:", repr(e), flush=True)
     return api("sendMessage", chat_id=chat_id, text=caption, parse_mode="HTML", reply_markup=kb)
@@ -2038,59 +2075,93 @@ def start_background_index(chat_id, tid, force_image=False, silent_start=False):
         ]]}
     )
 
-def poll():
-    global POLL_LAST_OK
-    offset=0
+def _update_worker(lane):
+    """Private messages stay responsive even during a large catalog import."""
     while True:
         try:
-            resp = requests.get(
+            item = INBOX.next(lane)
+            if item is None:
+                time.sleep(0.20)
+                continue
+            update_id, update = item
+            try:
+                handle(update)
+            except Exception as exc:
+                print(f"UPDATE WORKER error lane={lane} id={update_id}: {exc!r}", flush=True)
+                INBOX.failed(update_id, repr(exc))
+            else:
+                INBOX.done(update_id)
+        except Exception as exc:
+            print(f"UPDATE WORKER storage error lane={lane}: {exc!r}", flush=True)
+            time.sleep(3)
+
+
+def _historical_backfill_worker():
+    """Never block /start while historical Telegram exports are analyzed."""
+    configured = os.environ.get("TELEGRAM_EXPORT_JSON", "").strip()
+    candidates = ([Path(configured)] if configured else []) + [
+        Path("result.json"), Path("result(2).json"),
+    ]
+    export_path = next((path for path in candidates if path.is_file()), None)
+    if export_path is None:
+        print("BACKFILL: aucun export historique ; les nouveaux posts restent synchronises", flush=True)
+        return
+    if not should_run_backfill(
+        BACKFILL_STATE_FILE, export_path, RUNTIME_CATALOG, SEARCH_INDEX_FILE
+    ):
+        print("BACKFILL CACHE ✅ ancien export deja indexe", flush=True)
+        return
+    try:
+        report = backfill_catalog_from_export()
+        if report.get("file"):
+            mark_backfill_complete(BACKFILL_STATE_FILE, export_path)
+    except Exception as exc:
+        print(f"BACKFILL worker error: {exc!r}", flush=True)
+
+
+def poll():
+    global POLL_LAST_OK
+    offset = INBOX.accepted_offset()
+    while True:
+        try:
+            response = telegram_session().get(
                 f"{API}/getUpdates",
                 params={
-                    "timeout": 50,
+                    "timeout": 25,
                     "offset": offset,
+                    "limit": 100,
                     "allowed_updates": json.dumps([
                         "message", "edited_message", "callback_query",
                         "channel_post", "edited_channel_post"
                     ])
                 },
-                timeout=60
+                timeout=(8, 35)
             )
             try:
-                r = resp.json()
+                payload = response.json()
             except Exception:
-                r = {"ok": False, "description": resp.text[:500]}
-
-            if not r.get("ok"):
-                # Telegram renvoie notamment 409 lorsqu'un autre processus
-                # utilise déjà getUpdates avec le même token. Sans ce log,
-                # le bot semble démarré mais ne répond jamais aux messages.
+                payload = {"ok": False, "description": response.text[:500]}
+            if not payload.get("ok"):
                 print(
-                    f"TELEGRAM getUpdates ERROR HTTP={resp.status_code} "
-                    f"payload={r}",
+                    f"TELEGRAM getUpdates ERROR HTTP={response.status_code} "
+                    f"payload={payload}",
                     flush=True
                 )
                 time.sleep(5)
                 continue
-
-            POLL_LAST_OK = time.monotonic()
-            updates = r.get("result", []) or []
+            updates = payload.get("result", []) or []
             if updates:
-                print(f"TELEGRAM UPDATES: {len(updates)}", flush=True)
-            for u in updates:
-                offset=u["update_id"]+1
-                try:
-                    handle(u)
-                except Exception as e:
-                    print(
-                        f"TELEGRAM UPDATE ERROR id={u.get('update_id')}: {e!r}",
-                        flush=True
-                    )
-        except Exception as e:
-            print("Polling NETWORK ERROR:",repr(e),flush=True)
+                # Commit to SQLite before acknowledgement on the next getUpdates.
+                offset = INBOX.store(updates)
+                print(f"TELEGRAM UPDATES queued={len(updates)} lanes={INBOX.pending()}", flush=True)
+            POLL_LAST_OK = time.monotonic()
+        except Exception as exc:
+            print(f"Polling NETWORK / QUEUE ERROR: {exc!r}", flush=True)
             time.sleep(3)
 
+
 def main():
-    global POLL_WORKER
+    global POLL_WORKER, INBOX
     if not TOKEN:
         raise SystemExit("BOT_TOKEN manquant : le bot Telegram ne peut pas démarrer")
 
@@ -2149,7 +2220,7 @@ def main():
     except Exception as e:
         print(f"TELEGRAM WEBHOOK RESET ERROR: {e!r}", flush=True)
 
-    backfill_catalog_from_export()
+    INBOX = DurableUpdateInbox(DATA_DIR / "telegram_updates.sqlite3")
     print(f"Catalogue dynamique: {RUNTIME_CATALOG}", flush=True)
     print(f"AUTO {BUILD_VERSION}: accueil amélioré + recherche chaussures supprimée + topics auto = ACTIVÉ", flush=True)
     print("MODE GRATUIT: VISION LOCALE CLIP + CACHE = ACTIVÉ", flush=True)
@@ -2158,10 +2229,25 @@ def main():
     print(f"MODÈLE LOCAL: {LOCAL_VISION_MODEL}", flush=True)
     if not ADMIN_IDS:
         print("SECURITE: ADMIN_USER_ID absent, scans admin desactives", flush=True)
+    for lane in ("private", "catalog"):
+        worker = threading.Thread(
+            target=_update_worker, args=(lane,), daemon=True,
+            name=f"telegram-worker-{lane}"
+        )
+        worker.start()
+        UPDATE_WORKERS.append(worker)
     POLL_WORKER = threading.Thread(target=poll, daemon=True, name="telegram-poll")
     POLL_WORKER.start()
-    port=int(os.environ.get("PORT","8080"))
-    app.run(host="0.0.0.0",port=port,threaded=True)
+    threading.Thread(target=_historical_backfill_worker, daemon=True,
+                     name="telegram-history").start()
+
+    # A Telegram catalog worker does not need a public web server on a VM.
+    if os.environ.get("BOT_ONLY", "").strip().lower() in {"1", "true", "yes"}:
+        print("BOT_ONLY: aucun site web demarre, bot Telegram actif", flush=True)
+        while True:
+            time.sleep(60)
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
 
 if __name__=="__main__":
     main()
