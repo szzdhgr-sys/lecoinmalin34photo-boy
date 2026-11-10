@@ -26,7 +26,6 @@ SOURCE_CHAT_TITLES = {"Lecoinmalin34w", "Lecoinmalin34a"}
 
 PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "").strip()
-ORDER_URL = os.environ.get("ORDER_URL", "https://t.me/Lecoinmalin34a/76").strip()
 REVIEWS_URL = os.environ.get("REVIEWS_URL", "https://t.me/Lecoinmalin34a/5").strip()
 SOURCE_GROUP_URL = os.environ.get("SOURCE_GROUP_URL", "https://t.me/Lecoinmalin34a").strip()
 if not WEBAPP_URL and PUBLIC_DOMAIN:
@@ -1150,7 +1149,7 @@ def send_start(chat_id):
     topics, items, photos, videos = catalog_totals()
     caption = (
         "✨ <b>LE COIN MALIN 34 — CATALOGUE OFFICIEL</b> 🖤💛\n\n"
-        "Bienvenue 👋 Découvrez nos produits, photos et vidéos directement depuis le catalogue.\n\n"
+        "Bienvenue 👋 Explorez notre catalogue de photos et vidéos par catégorie, marque ou modèle.\n\n"
         "🆕 <b>Nouveautés</b> : les derniers articles ajoutés\n"
         "📦 <b>Sur place</b> : les produits disponibles immédiatement\n"
         "🚚 <b>Prêts à expédier</b> : accès rapide aux produits concernés\n\n"
@@ -1168,7 +1167,6 @@ def send_start(chat_id):
         [{"text":"⌚  Montres & Bijoux","callback_data":"group:watches"}],
         [{"text":"👜  Accessoires","callback_data":"group:accessories"}],
         [{"text":"🚚  Produits prêts à être expédiés","callback_data":"group:ready"}],
-        [{"text":"🛒  Commander / Comment ça marche","callback_data":"group:order"}],
         [{"text":"💬  Avis clients","callback_data":"group:reviews"}],
         [{"text":"📣  Voir le groupe LE COIN MALIN 34","url":SOURCE_GROUP_URL}],
         [{"text":"✨  Voir plus","callback_data":"group:more"}],
@@ -1215,10 +1213,7 @@ def send_new_page(chat_id, offset=0):
     if offset + PAGE_SIZE < len(ids):
         nav.append({"text":"Plus anciennes ➡️","callback_data":f"new:{offset+PAGE_SIZE}"})
     rows=[nav] if nav else []
-    rows.append([
-        {"text":"🛒 Commander","url":ORDER_URL},
-        {"text":"💬 Avis clients","url":REVIEWS_URL}
-    ])
+    rows.append([{"text":"💬 Avis clients","url":REVIEWS_URL}])
     rows.append([{"text":"🏠 Accueil","callback_data":"home"}])
     return api("sendMessage", chat_id=chat_id, text="✨ <b>Catalogue actualisé automatiquement</b>",
                parse_mode="HTML", reply_markup={"inline_keyboard":rows})
@@ -1705,10 +1700,7 @@ def send_page(chat_id, tid, offset=0):
     if end<total:
         nav.append({"text":"Suivants ➡️","callback_data":f"cat:{tid}:{end}"})
     rows=[nav] if nav else []
-    rows.append([
-        {"text":"🛒 Commander","url":ORDER_URL},
-        {"text":"💬 Avis clients","url":REVIEWS_URL}
-    ])
+    rows.append([{"text":"💬 Avis clients","url":REVIEWS_URL}])
     rows.append([{"text":"🏠 Accueil","callback_data":"home"}])
     api("sendMessage", chat_id=chat_id,
         text=f"✅ <b>{end} / {total} éléments affichés</b>",
